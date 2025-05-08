@@ -1,0 +1,122 @@
+networks:
+  saffm-net:
+    driver: bridge
+
+services:
+  api:
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    image: saffm.azurecr.io/saf-fmbop-server:latest
+    container_name: saf-fm-api
+    ports:
+      - 5050:5050
+    networks:
+      - saffm-net
+    environment:
+      SQL_SERVER_HOST: "mssql_db"
+      SQL_SERVER_DATABASE: "DOD_Dev"
+      SQL_SERVER_USERNAME: "sa"
+      SQL_SERVER_PASSWORD: "Entity*123"
+      BLOB_CONNECTION_STRING: "AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;DefaultEndpointsProtocol=http;BlobEndpoint=http://azurite:10000/devstoreaccount1"
+      BLOB_CONTAINER_NAME: "jbooks"
+      BLOB_STORAGE_ACCOUNT: "devstoreaccount1"
+      QDRANT_URL: "http://vector_db:6333"
+      AZURE_OPENAI_API_KEY: 6YWVsGy5Fr1AiKG74ZM7H3bdKNVnXjEVuoPv3UxTWbasDqfwkCt4JQQJ99BCACYeBjFXJ3w3AAABACOGODDQ
+      AZURE_OPENAI_LLM_MODEL: gpt-4o
+      AZURE_OPENAI_ENDPOINT: https://ieai.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview
+      AZURE_OPENAI_LLM_MODEL_VERSION: 2024-12-01-preview
+      AZURE_OPENAI_EMBEDDINGS_MODEL: text-embedding-3-small
+      AZURE_OPENAI_EMBEDDINGS_ENDPOINT: https://ieai.openai.azure.com/openai/deployments/text-embedding-3-small/embeddings?api-version=2023-05-15
+      AZURE_OPENAI_EMBEDDINGS_VERSION: 2024-12-01-preview
+      FAST_EMBDED_MODEL: prithivida/Splade_PP_en_v1
+      CROSS_ENCODER_RERANK_MODEL: cross-encoder/ms-marco-MiniLM-L-12-v2
+
+    depends_on:
+      - mssql_db
+      - vector_db
+      - azurite
+      
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5050/api || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 5
+      start_period: 3m
+
+    restart: always
+    command: python app.py
+
+  mssql_db:
+    image: mcr.microsoft.com/mssql/server
+    container_name: mssql_db
+    hostname: mssql_db
+    ports:
+      - 1433:1433
+    networks:
+      - saffm-net
+    environment:
+      - ACCEPT_EULA=yes
+      - SA_PASSWORD=Entity*123
+      # - MSSQL_DATA_DIR=/var/opt/sqlserver/data
+      # - MSSQL_LOG_DIR=/var/opt/sqlserver/log
+      # - MSSQL_BACKUP_DIR=/var/opt/sqlserver/backup
+    volumes:
+      - sqlsystem-saf-fm:/var/opt/mssql/
+      - sqldata-saf-fm:/var/opt/sqlserver/data
+      - sqllog-saf-fm:/var/opt/sqlserver/log
+      - sqlbackup-saf-fm:/var/opt/sqlserver/backup
+    restart: always
+
+  vector_db:
+    image: qdrant/qdrant
+    container_name: qdrant-db
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    ports:
+      - 6333:6333
+      - 6334:6334
+    volumes:
+      - qdrant-db:/qdrant/storage
+    networks:
+      - saffm-net
+    restart: always
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    container_name: azurite-storage
+    hostname: azurite
+    command: 'azurite --loose --skipApiVersionCheck --blobHost 0.0.0.0 --blobPort 10000 --queueHost 0.0.0.0 --queuePort 10001 --tableHost 0.0.0.0 --tablePort 10002 --location /workspace --debug /workspace/debug.log'
+    ports:
+      - 10000:10000
+      - 10001:10001
+      - 10002:10002
+    volumes:
+      - azurite-saf-fm:/workspace
+    networks:
+      - saffm-net
+    restart: always
+  
+  client:
+    image: saffm.azurecr.io/saf-fmbop:latest
+    ports:
+      - 3000:3000
+    depends_on:
+      api:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    networks:
+      - saffm-net
+    command: npm start
+    restart: always
+
+
+
+volumes:
+  sqlsystem-saf-fm:
+  sqldata-saf-fm:
+  sqllog-saf-fm:
+  sqlbackup-saf-fm:
+  qdrant-db:
+  azurite-saf-fm:
