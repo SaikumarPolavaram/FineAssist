@@ -1,0 +1,142 @@
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Tuple, Set, Optional, Dict
+from langchain_core.documents import Document
+from src.common.helpers import (
+    query_rewrite,
+    get_collections,
+    get_suitable_collection,
+    get_knowledge_base,
+    get_verified_retrieval_chunks,
+    dynamic_k,
+    combine_responses,
+    llm,
+)
+from src.common.timings import time_it, logger
+
+# Define a simplified state
+class RAGState(TypedDict):
+    query: str
+    sub_queries: List[str]  # List of sub-queries
+    available_collections: List[str]  # List of available collections
+    sub_query_responses: Dict[str, str]  # Response per sub-query
+    sub_query_sources: Dict[str, Set[str]]  # Sources per sub-query
+    response: str  # Final combined response
+    sources: Set[str]  # Combined sources
+    top_percentage: float
+    min_docs: int
+    knowledge_base_details: str
+
+# LangGraph Nodes
+def split_sub_queries_node(state: RAGState) -> RAGState:
+    """
+    Split the query into sub-queries and initialize state.
+    """
+    updated_state = state.copy()
+    available_collections = [c for c in get_collections() if c != "JBooks_KnowledgeBase"]
+    updated_state["available_collections"] = available_collections
+    updated_state["knowledge_base_details"] = get_knowledge_base(state["query"])
+    rewritten_query = query_rewrite(state["query"], llm)
+    updated_state["sub_queries"] = [q.strip() for q in rewritten_query.split("Sub-Query:") if q.strip()]
+    updated_state["sub_query_responses"] = {sub_q: "" for sub_q in updated_state["sub_queries"]}
+    updated_state["sub_query_sources"] = {sub_q: set() for sub_q in updated_state["sub_queries"]}
+    logger.info(f"Split into {len(updated_state['sub_queries'])} sub-queries: {updated_state['sub_queries']}")
+    return updated_state
+
+def process_sub_queries_node(state: RAGState) -> RAGState:
+    """
+    Process each sub-query using get_verified_retrieval_chunks with dynamic k.
+    """
+    updated_state = state.copy()
+    for sub_query in state["sub_queries"]:
+        logger.info(f"Processing sub-query: {sub_query}")
+        selected_collections = get_suitable_collection(sub_query, state["available_collections"])
+        if not selected_collections:
+            logger.warning(f"No suitable collections found for sub-query: {sub_query}")
+            updated_state["sub_query_responses"][sub_query] = "No data available from data sources."
+            continue
+        
+        # Dynamically estimate k
+        k, complexity, sections = dynamic_k(sub_query, llm, min_k=5, max_k=20)
+        logger.info(f"Sub-Query: {sub_query}, Complexity: {complexity}, k: {k}, Sections: {sections}")
+        
+        # Retrieve and generate response
+        response, sources = get_verified_retrieval_chunks(
+            sub_query,
+            state["available_collections"],
+            state["knowledge_base_details"],
+            k=k,
+            top_percentage=state["top_percentage"],
+            min_docs=state["min_docs"]
+        )
+        updated_state["sub_query_responses"][sub_query] = response
+        updated_state["sub_query_sources"][sub_query] = sources
+        logger.info(f"Sub-query response: {response[:100]}... Sources: {sources}")
+    return updated_state
+
+def generate_response_node(state: RAGState) -> RAGState:
+    """
+    Combine sub-query responses into a final response.
+    """
+    updated_state = state.copy()
+    combined_response = []
+    combined_sources = set()
+    for sub_query in state["sub_queries"]:
+        response = updated_state["sub_query_responses"][sub_query]
+        sources = updated_state["sub_query_sources"][sub_query]
+        combined_response.append(f"**{sub_query}**\n{response}")
+        combined_sources.update(sources)
+    
+    updated_state["response"] = combine_responses(
+        state["query"],
+        '\n'.join(combined_response),
+        state["knowledge_base_details"],
+        llm
+    )
+    updated_state["sources"] = combined_sources
+    logger.info(f"Final response: {updated_state['response'][:100]}... Sources: {combined_sources}")
+    return updated_state
+
+# Build the LangGraph Workflow
+workflow = StateGraph(RAGState)
+workflow.add_node("split_sub_queries", split_sub_queries_node)
+workflow.add_node("process_sub_queries", process_sub_queries_node)
+workflow.add_node("generate_response", generate_response_node)
+
+workflow.set_entry_point("split_sub_queries")
+workflow.add_edge("split_sub_queries", "process_sub_queries")
+workflow.add_edge("process_sub_queries", "generate_response")
+workflow.add_edge("generate_response", END)
+
+# Compile the Graph
+agent = workflow.compile()
+
+# Main Function to Run the Agentic RAG
+@time_it
+def generate_response_agentic(query: str, top_percentage: float = 80.0, min_docs: int = 5) -> Tuple[str, Set[str]]:
+    """
+    Generate a response using the agentic RAG workflow with sub-query support and dynamic k.
+    
+    Args:
+        query: The input query string.
+        top_percentage: Percentage of re-ranked documents to keep (default: 80.0).
+        min_docs: Minimum number of documents to return (default: 5).
+    
+    Returns:
+        Tuple of (response: str, sources: Set[str])
+    """
+    initial_state = {
+        "query": query,
+        "sub_queries": [],
+        "available_collections": [],
+        "sub_query_responses": {},
+        "sub_query_sources": {},
+        "response": "",
+        "sources": set(),
+        "top_percentage": top_percentage,
+        "min_docs": min_docs,
+        "knowledge_base_details": ""
+    }
+    result = agent.invoke(initial_state)
+    response = result.get("response", "No response generated.")
+    sources = result.get("sources", set())
+    return response, sources
